@@ -27,6 +27,12 @@ from datetime import datetime, timedelta
 import threading
 import traceback
 
+from keep_alive import keep_alive
+
+# Start the webserver for uptime pings
+keep_alive()
+
+
 # =======================
 # Web Keep-Alive (Flask)
 # =======================
